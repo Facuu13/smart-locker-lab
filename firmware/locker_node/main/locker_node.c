@@ -2,6 +2,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_event.h"
@@ -14,6 +15,8 @@
 
 #include <inttypes.h>
 
+#include "driver/gpio.h"
+
 
 static const char *TAG_MQTT = "MQTT";
 static esp_mqtt_client_handle_t s_mqtt = NULL;
@@ -25,6 +28,8 @@ static esp_mqtt_client_handle_t s_mqtt = NULL;
 static uint32_t s_seq = 0;
 #define TELEMETRY_PERIOD_MS 5000
 
+#define GPIO_BTN 17
+#define TOPIC_EVENT "locker/locker-01/event"
 
 
 #define WIFI_SSID "quepasapatejode"
@@ -34,6 +39,17 @@ static const char *TAG = "WIFI";
 
 static EventGroupHandle_t s_wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
+
+static QueueHandle_t s_btn_queue = NULL;
+
+typedef struct {
+    int64_t ts_us;
+    int gpio;
+} btn_event_t;
+
+static volatile int64_t s_last_isr_us = 0;
+#define ISR_DEBOUNCE_MS 80
+
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
@@ -113,38 +129,97 @@ static void mqtt_start(void)
     ESP_LOGI(TAG_MQTT, "Starting MQTT: %s", MQTT_BROKER_URI);
 }
 
-static void publish_telemetry_once(void)
+
+static void IRAM_ATTR btn_isr_handler(void *arg)
 {
-    if (!s_mqtt) return;
+    int64_t now = esp_timer_get_time(); // microsegundos
 
-    char payload[128];
-    int64_t ts = esp_timer_get_time() / 1000000; // segundos
+    // debounce simple en ISR
+    if ((now - s_last_isr_us) < (ISR_DEBOUNCE_MS * 1000)) return;
+    s_last_isr_us = now;
 
-    snprintf(payload, sizeof(payload),
-             "{\"ts\":%" PRId64 ",\"seq\":%u,\"msg\":\"periodic\"}",
-             ts, (unsigned)s_seq++);
+    btn_event_t ev = {
+        .ts_us = now,
+        .gpio = (int)(intptr_t)arg
+    };
 
-    esp_mqtt_client_publish(s_mqtt, TOPIC_TELEMETRY, payload, 0, 1, 0);
-    ESP_LOGI(TAG_MQTT, "Telemetry sent: %s", payload);
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(s_btn_queue, &ev, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
 }
+
+static void button_gpio_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << GPIO_BTN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE, // asumiendo botón a GND
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(GPIO_BTN, btn_isr_handler, (void*)(intptr_t)GPIO_BTN));
+
+    ESP_LOGI("BTN", "Button configured on GPIO %d (pull-up, negedge IRQ)", GPIO_BTN);
+}
+
+static void button_task(void *arg)
+{
+    btn_event_t ev;
+
+    while (1) {
+        if (xQueueReceive(s_btn_queue, &ev, portMAX_DELAY)) {
+            if (s_mqtt) {
+                char payload[128];
+                int64_t ts_s = ev.ts_us / 1000000;
+
+                snprintf(payload, sizeof(payload),
+                         "{\"type\":\"button_press\",\"gpio\":%d,\"ts\":%" PRId64 "}",
+                         ev.gpio, ts_s);
+
+                esp_mqtt_client_publish(s_mqtt, TOPIC_EVENT, payload, 0, 1, 0);
+                ESP_LOGI(TAG_MQTT, "Button event sent: %s", payload);
+            } else {
+                ESP_LOGW(TAG_MQTT, "MQTT not ready, drop button event");
+            }
+        }
+    }
+}
+
 
 
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
-    wifi_init_sta();
 
+    // 1) WiFi
+    wifi_init_sta();
     ESP_LOGI(TAG, "Waiting for WiFi...");
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
     ESP_LOGI(TAG, "WiFi connected! Now ticking...");
+    
+    // 2) MQTT
     mqtt_start();
 
-    while (1) {
-        publish_telemetry_once();
-        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
+    // 3) Queue + GPIO + Task
+    s_btn_queue = xQueueCreate(8, sizeof(btn_event_t));
+    if (!s_btn_queue) {
+        ESP_LOGE("BTN", "Failed to create queue");
+        return;
     }
+
+    button_gpio_init();
+    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
+
+    // 4) Loop vacío (o logs)
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
 
 
 }
