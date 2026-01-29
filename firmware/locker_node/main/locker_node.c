@@ -48,7 +48,10 @@ typedef struct {
 } btn_event_t;
 
 static volatile int64_t s_last_isr_us = 0;
-#define ISR_DEBOUNCE_MS 80
+#define ISR_DEBOUNCE_MS 150
+
+static bool s_door_open = false;
+
 
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -155,7 +158,7 @@ static void button_gpio_init(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE, // asumiendo botón a GND
+        .intr_type = GPIO_INTR_ANYEDGE, 
     };
     ESP_ERROR_CHECK(gpio_config(&io));
 
@@ -171,19 +174,33 @@ static void button_task(void *arg)
 
     while (1) {
         if (xQueueReceive(s_btn_queue, &ev, portMAX_DELAY)) {
+
+            // confirmación anti-rebote (fuera de ISR)
+            vTaskDelay(pdMS_TO_TICKS(30));
+            int level = gpio_get_level(ev.gpio);
+
+            // Con pull-up + botón a GND:
+            // level == 0 => down (apretado)
+            // level == 1 => up (soltado)
+            const char *etype = (level == 0) ? "button_down" : "button_up";
+
+            // (opcional) si querés ignorar rebotes muy seguidos incluso con ANYEDGE,
+            // podés dejar el ISR_DEBOUNCE_MS en 80-150ms como ya hiciste.
+
             if (s_mqtt) {
-                char payload[128];
+                char payload[180];
                 int64_t ts_s = ev.ts_us / 1000000;
 
                 snprintf(payload, sizeof(payload),
-                         "{\"type\":\"button_press\",\"gpio\":%d,\"ts\":%" PRId64 "}",
-                         ev.gpio, ts_s);
+                        "{\"type\":\"%s\",\"gpio\":%d,\"ts\":%" PRId64 ",\"level\":%d}",
+                        etype, ev.gpio, ts_s, level);
 
                 esp_mqtt_client_publish(s_mqtt, TOPIC_EVENT, payload, 0, 1, 0);
                 ESP_LOGI(TAG_MQTT, "Button event sent: %s", payload);
             } else {
                 ESP_LOGW(TAG_MQTT, "MQTT not ready, drop button event");
             }
+
         }
     }
 }
@@ -201,7 +218,7 @@ void app_main(void)
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
     ESP_LOGI(TAG, "WiFi connected! Now ticking...");
-    
+
     // 2) MQTT
     mqtt_start();
 
