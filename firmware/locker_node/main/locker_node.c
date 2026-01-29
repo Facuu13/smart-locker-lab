@@ -12,12 +12,18 @@
 #include "mqtt_client.h"
 #include "esp_timer.h"
 
+#include <inttypes.h>
+
+
 static const char *TAG_MQTT = "MQTT";
 static esp_mqtt_client_handle_t s_mqtt = NULL;
 
 // Cambiá la IP por la de tu PC:
 #define MQTT_BROKER_URI "mqtt://192.168.1.11:1883"
 #define TOPIC_TELEMETRY "locker/locker-01/telemetry"
+
+static uint32_t s_seq = 0;
+#define TELEMETRY_PERIOD_MS 5000
 
 
 
@@ -107,6 +113,21 @@ static void mqtt_start(void)
     ESP_LOGI(TAG_MQTT, "Starting MQTT: %s", MQTT_BROKER_URI);
 }
 
+static void publish_telemetry_once(void)
+{
+    if (!s_mqtt) return;
+
+    char payload[128];
+    int64_t ts = esp_timer_get_time() / 1000000; // segundos
+
+    snprintf(payload, sizeof(payload),
+             "{\"ts\":%" PRId64 ",\"seq\":%u,\"msg\":\"periodic\"}",
+             ts, (unsigned)s_seq++);
+
+    esp_mqtt_client_publish(s_mqtt, TOPIC_TELEMETRY, payload, 0, 1, 0);
+    ESP_LOGI(TAG_MQTT, "Telemetry sent: %s", payload);
+}
+
 
 void app_main(void)
 {
@@ -119,6 +140,11 @@ void app_main(void)
 
     ESP_LOGI(TAG, "WiFi connected! Now ticking...");
     mqtt_start();
-    
+
+    while (1) {
+        publish_telemetry_once();
+        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
+    }
+
 
 }
