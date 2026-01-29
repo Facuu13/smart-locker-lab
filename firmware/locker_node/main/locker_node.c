@@ -9,6 +9,18 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 
+#include "mqtt_client.h"
+#include "esp_timer.h"
+
+static const char *TAG_MQTT = "MQTT";
+static esp_mqtt_client_handle_t s_mqtt = NULL;
+
+// Cambiá la IP por la de tu PC:
+#define MQTT_BROKER_URI "mqtt://192.168.1.11:1883"
+#define TOPIC_TELEMETRY "locker/locker-01/telemetry"
+
+
+
 #define WIFI_SSID "quepasapatejode"
 #define WIFI_PASS "losvilla08"
 
@@ -59,6 +71,43 @@ static void wifi_init_sta(void)
     ESP_LOGI(TAG, "wifi_init_sta done (SSID=%s)", WIFI_SSID);
 }
 
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG_MQTT, "Connected to broker");
+            // publish hello
+            esp_mqtt_client_publish(s_mqtt, TOPIC_TELEMETRY,
+                                   "{\"msg\":\"hello from esp32\"}",
+                                   0, 1, 0);
+            break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG_MQTT, "Disconnected from broker");
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void mqtt_start(void)
+{
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+    };
+
+    s_mqtt = esp_mqtt_client_init(&cfg);
+    esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt);
+
+    ESP_LOGI(TAG_MQTT, "Starting MQTT: %s", MQTT_BROKER_URI);
+}
+
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -69,8 +118,7 @@ void app_main(void)
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
     ESP_LOGI(TAG, "WiFi connected! Now ticking...");
-    while (1) {
-        ESP_LOGI(TAG, "tick");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    mqtt_start();
+    
+
 }
