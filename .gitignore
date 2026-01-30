@@ -1,3 +1,5 @@
 firmware/locker_node/build/
 infra/mosquitto/data/
 infra/mosquitto/log/
+
+backend/.venv/
