@@ -31,6 +31,12 @@ static uint32_t s_seq = 0;
 #define GPIO_BTN 17
 #define TOPIC_EVENT "locker/locker-01/event"
 
+#define GPIO_RELAY 2
+
+#define TOPIC_CMD "locker/locker-01/cmd"
+#define TOPIC_ACK "locker/locker-01/ack"
+
+
 
 #define WIFI_SSID "quepasapatejode"
 #define WIFI_PASS "losvilla08"
@@ -51,6 +57,19 @@ static volatile int64_t s_last_isr_us = 0;
 #define ISR_DEBOUNCE_MS 150
 
 static bool s_door_open = false;
+
+typedef struct {
+    char cmd_id[32];
+    int duration_ms;
+    bool unlock;   // true = unlock (pulso), false = lock (apagar)
+} relay_cmd_t;
+
+static QueueHandle_t s_relay_queue = NULL;
+static bool s_relay_on = false;
+
+
+static void handle_cmd(const char *data, int len);
+
 
 
 
@@ -105,6 +124,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG_MQTT, "Connected to broker");
             // publish hello
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_CMD, 1);
+            ESP_LOGI(TAG_MQTT, "Subscribed: %s", TOPIC_CMD);
+
             esp_mqtt_client_publish(s_mqtt, TOPIC_TELEMETRY,
                                    "{\"msg\":\"hello from esp32\"}",
                                    0, 1, 0);
@@ -113,6 +135,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG_MQTT, "Disconnected from broker");
             break;
+        
+        case MQTT_EVENT_DATA:
+            if (event->topic_len == strlen(TOPIC_CMD) &&
+                strncmp(event->topic, TOPIC_CMD, event->topic_len) == 0) {
+                ESP_LOGI(TAG_MQTT, "CMD recv: %.*s", event->data_len, event->data);
+                handle_cmd(event->data, event->data_len);
+            }
+            break;
+
 
         default:
             break;
@@ -218,6 +249,151 @@ static void button_task(void *arg)
 }
 
 
+static void relay_gpio_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << GPIO_RELAY),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+
+    gpio_set_level(GPIO_RELAY, 0);
+    s_relay_on = false;
+
+    ESP_LOGI("RELAY", "Relay configured on GPIO %d", GPIO_RELAY);
+}
+
+static void relay_set(bool on)
+{
+    s_relay_on = on;
+    gpio_set_level(GPIO_RELAY, on ? 1 : 0);
+}
+
+
+static void publish_ack(const char *cmd_id, bool ok, const char *msg)
+{
+    if (!s_mqtt) return;
+
+    char payload[220];
+    int64_t ts_s = esp_timer_get_time() / 1000000;
+
+    snprintf(payload, sizeof(payload),
+             "{\"cmd_id\":\"%s\",\"ok\":%s,\"ts\":%" PRId64 ",\"msg\":\"%s\"}",
+             cmd_id, ok ? "true" : "false", ts_s, msg);
+
+    esp_mqtt_client_publish(s_mqtt, TOPIC_ACK, payload, 0, 1, 0);
+    ESP_LOGI(TAG_MQTT, "ACK sent: %s", payload);
+}
+
+static void relay_task(void *arg)
+{
+    relay_cmd_t cmd;
+
+    while (1) {
+        if (xQueueReceive(s_relay_queue, &cmd, portMAX_DELAY)) {
+
+            if (!s_mqtt) {
+                ESP_LOGW("RELAY", "MQTT not ready, skip relay cmd");
+                continue;
+            }
+
+            if (cmd.unlock) {
+                ESP_LOGI("RELAY", "UNLOCK cmd_id=%s duration_ms=%d", cmd.cmd_id, cmd.duration_ms);
+                relay_set(true);
+                vTaskDelay(pdMS_TO_TICKS(cmd.duration_ms));
+                relay_set(false);
+                publish_ack(cmd.cmd_id, true, "unlock_done");
+            } else {
+                ESP_LOGI("RELAY", "LOCK cmd_id=%s", cmd.cmd_id);
+                relay_set(false);
+                publish_ack(cmd.cmd_id, true, "locked");
+            }
+        }
+    }
+}
+
+
+static bool extract_str(const char *json, int len, const char *key, char *out, int out_sz)
+{
+    // busca: "key":"value"
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    const char *e = memchr(p, '"', (json + len) - p);
+    if (!e) return false;
+
+    int n = (int)(e - p);
+    if (n <= 0 || n >= out_sz) return false;
+
+    memcpy(out, p, n);
+    out[n] = 0;
+    return true;
+}
+
+static bool extract_int(const char *json, int len, const char *key, int *out)
+{
+    // busca: "key":123
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(json, pat);
+    if (!p) return false;
+    p += strlen(pat);
+
+    // parsea int
+    int v = 0;
+    if (sscanf(p, "%d", &v) == 1) {
+        *out = v;
+        return true;
+    }
+    return false;
+}
+
+static void handle_cmd(const char *data, int len)
+{
+    // copiar a buffer 0-terminated
+    char buf[256];
+    int n = (len < (int)sizeof(buf) - 1) ? len : (int)sizeof(buf) - 1;
+    memcpy(buf, data, n);
+    buf[n] = 0;
+
+    relay_cmd_t cmd = {0};
+    cmd.duration_ms = 1500; // default
+
+    if (!extract_str(buf, n, "cmd_id", cmd.cmd_id, sizeof(cmd.cmd_id))) {
+        strncpy(cmd.cmd_id, "na", sizeof(cmd.cmd_id));
+    }
+
+    char action[32] = {0};
+    if (!extract_str(buf, n, "action", action, sizeof(action))) {
+        publish_ack(cmd.cmd_id, false, "missing_action");
+        return;
+    }
+
+    extract_int(buf, n, "duration_ms", &cmd.duration_ms);
+    if (cmd.duration_ms < 50) cmd.duration_ms = 50;
+    if (cmd.duration_ms > 10000) cmd.duration_ms = 10000;
+
+    if (strcmp(action, "unlock") == 0) {
+        cmd.unlock = true;
+    } else if (strcmp(action, "lock") == 0) {
+        cmd.unlock = false;
+    } else {
+        publish_ack(cmd.cmd_id, false, "unknown_action");
+        return;
+    }
+
+    if (!s_relay_queue) {
+        publish_ack(cmd.cmd_id, false, "relay_queue_not_ready");
+        return;
+    }
+
+    xQueueSend(s_relay_queue, &cmd, 0);
+}
 
 
 void app_main(void)
@@ -234,6 +410,12 @@ void app_main(void)
 
     // 2) MQTT
     mqtt_start();
+
+    relay_gpio_init();
+
+    s_relay_queue = xQueueCreate(8, sizeof(relay_cmd_t));
+    xTaskCreate(relay_task, "relay_task", 4096, NULL, 5, NULL);
+
 
     // 3) Queue + GPIO + Task
     s_btn_queue = xQueueCreate(8, sizeof(btn_event_t));
