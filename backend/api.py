@@ -14,10 +14,13 @@ from pathlib import Path
 import sqlite3
 from pathlib import Path
 
+import os
 
-# -------- Config --------
-BROKER_HOST = "192.168.1.11"
-BROKER_PORT = 1883
+import os
+
+BROKER_HOST = os.getenv("BROKER_HOST", "192.168.1.11")
+BROKER_PORT = int(os.getenv("BROKER_PORT", "1883"))
+
 SUB_TOPIC = "locker/#"
 
 DB_PATH = Path(__file__).with_name("locker.db")
