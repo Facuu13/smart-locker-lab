@@ -11,10 +11,22 @@ import paho.mqtt.client as mqtt
 from db import init_db, insert_message, upsert_locker_state
 from pathlib import Path
 
+import sqlite3
+from pathlib import Path
+
+
 # -------- Config --------
 BROKER_HOST = "192.168.1.11"
 BROKER_PORT = 1883
 SUB_TOPIC = "locker/#"
+
+DB_PATH = Path(__file__).with_name("locker.db")
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 LOCKER_CMD_TOPIC_FMT = "locker/{locker_id}/cmd"
 
@@ -113,3 +125,49 @@ def unlock(locker_id: str, req: UnlockRequest):
 
     pub.publish(topic, json.dumps(payload, separators=(",", ":")), qos=1, retain=False)
     return {"sent": True, "topic": topic, "payload": payload}
+
+@app.get("/lockers")
+def list_lockers():
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT locker_id FROM messages WHERE locker_id IS NOT NULL ORDER BY locker_id"
+    ).fetchall()
+    conn.close()
+    return {"lockers": [r["locker_id"] for r in rows]}
+
+@app.get("/lockers/{locker_id}/state")
+def locker_state(locker_id: str):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT locker_id, ts_update, door, relay, raw_payload FROM locker_state WHERE locker_id=?",
+        (locker_id,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="locker not found")
+
+    return dict(row)
+
+@app.get("/messages")
+def get_messages(limit: int = 50):
+    limit = max(1, min(limit, 500))
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, ts_ingest, topic, kind, locker_id, payload FROM messages ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return {"messages": [dict(r) for r in rows]}
+
+@app.get("/lockers/{locker_id}/events")
+def get_locker_events(locker_id: str, limit: int = 50):
+    limit = max(1, min(limit, 500))
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, ts_ingest, topic, payload FROM messages "
+        "WHERE locker_id=? AND kind='event' ORDER BY id DESC LIMIT ?",
+        (locker_id, limit),
+    ).fetchall()
+    conn.close()
+    return {"events": [dict(r) for r in rows]}
