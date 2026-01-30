@@ -2,7 +2,7 @@ import json
 import time
 import paho.mqtt.client as mqtt
 
-from db import init_db, insert_message
+from db import init_db, insert_message, upsert_locker_state 
 
 BROKER_HOST = "192.168.1.11"   # IP de tu PC donde corre Mosquitto
 BROKER_PORT = 1883
@@ -29,6 +29,17 @@ def on_message(client, userdata, msg):
     # Guardar SIEMPRE como texto (aunque no sea JSON válido)
     insert_message(ts_ingest, msg.topic, payload, kind, locker_id)
 
+    # Si es telemetry válida, actualizamos estado actual del locker
+    if kind == "telemetry" and locker_id:
+        try:
+            obj = json.loads(payload)
+            door = obj.get("door")
+            relay = obj.get("relay")
+            upsert_locker_state(locker_id, ts_ingest, door, relay, payload)
+        except Exception:
+            # si no es JSON o no tiene campos, lo ignoramos
+            pass
+
     # Print para debug
     try:
         json.loads(payload)
@@ -36,6 +47,7 @@ def on_message(client, userdata, msg):
     except Exception:
         ok = "raw"
     print(f"[{time.strftime('%H:%M:%S')}] ({ok}) {msg.topic} {payload}")
+
 
 def main():
     init_db()

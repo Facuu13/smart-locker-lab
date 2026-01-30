@@ -129,3 +129,20 @@ def unlock(locker_id: str, req: UnlockRequest):
 
     pub.publish(topic, payload)
     return {"sent": True, "topic": topic, "payload": payload}
+
+def get_locker_state(locker_id: str):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT locker_id, ts_update, door, relay, raw_payload FROM locker_state WHERE locker_id=?",
+        (locker_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+@app.get("/lockers/{locker_id}/state")
+def locker_state(locker_id: str):
+    st = get_locker_state(locker_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="locker not found")
+    return st
+
