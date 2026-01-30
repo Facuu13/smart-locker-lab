@@ -3,3 +3,5 @@ infra/mosquitto/data/
 infra/mosquitto/log/
 
 backend/.venv/
+backend/__pycache__/
+backend/locker.db
