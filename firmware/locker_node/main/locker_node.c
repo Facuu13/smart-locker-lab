@@ -69,6 +69,7 @@ static bool s_relay_on = false;
 
 
 static void handle_cmd(const char *data, int len);
+static void publish_telemetry_state(void);
 
 
 
@@ -243,6 +244,7 @@ static void button_task(void *arg)
             if (new_door_open != s_door_open) {
                 s_door_open = new_door_open;
                 publish_door_event(s_door_open, ev.gpio, ev.ts_us);
+                publish_telemetry_state();
             }
         }
     }
@@ -270,6 +272,7 @@ static void relay_set(bool on)
 {
     s_relay_on = on;
     gpio_set_level(GPIO_RELAY, on ? 1 : 0);
+    publish_telemetry_state();
 }
 
 
@@ -393,6 +396,24 @@ static void handle_cmd(const char *data, int len)
     }
 
     xQueueSend(s_relay_queue, &cmd, 0);
+}
+
+
+static void publish_telemetry_state(void)
+{
+    if (!s_mqtt) return;
+
+    char payload[200];
+    int64_t ts_s = esp_timer_get_time() / 1000000;
+
+    snprintf(payload, sizeof(payload),
+             "{\"ts\":%" PRId64 ",\"door\":\"%s\",\"relay\":\"%s\"}",
+             ts_s,
+             s_door_open ? "open" : "closed",
+             s_relay_on ? "on" : "off");
+
+    esp_mqtt_client_publish(s_mqtt, TOPIC_TELEMETRY, payload, 0, 1, 0);
+    ESP_LOGI(TAG_MQTT, "Telemetry state sent: %s", payload);
 }
 
 
