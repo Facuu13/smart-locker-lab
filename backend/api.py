@@ -32,12 +32,13 @@ LOCKER_CMD_TOPIC_FMT = "locker/{locker_id}/cmd"
 
 app = FastAPI(title="Smart Locker Lab (Unified)")
 
-# Publisher (para POST /unlock)
-pub = mqtt.Client()
 pub_connected = False
 
-# Subscriber (ingestor)
-sub = mqtt.Client()
+
+
+pub = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+sub = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+
 
 def classify_topic(topic: str) -> tuple[str, str | None]:
     parts = topic.split("/")
@@ -49,10 +50,13 @@ def classify_topic(topic: str) -> tuple[str, str | None]:
 def _pub_on_connect(client, userdata, flags, rc, properties=None):
     global pub_connected
     pub_connected = (rc == 0)
+    print("PUB connected rc=", rc)
 
 def _pub_on_disconnect(client, userdata, rc, properties=None):
     global pub_connected
     pub_connected = False
+    print("PUB disconnected rc=", rc)
+
 
 # -------- MQTT subscriber callbacks --------
 def _sub_on_connect(client, userdata, flags, rc, properties=None):
@@ -83,16 +87,19 @@ def _sub_on_message(client, userdata, msg):
 
 def _start_mqtt_clients():
     # Publisher
+    pub.reconnect_delay_set(min_delay=1, max_delay=10)
     pub.on_connect = _pub_on_connect
     pub.on_disconnect = _pub_on_disconnect
     pub.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
     pub.loop_start()
 
     # Subscriber
+    sub.reconnect_delay_set(min_delay=1, max_delay=10)
     sub.on_connect = _sub_on_connect
     sub.on_message = _sub_on_message
     sub.connect(BROKER_HOST, BROKER_PORT, keepalive=60)
-    sub.loop_forever()
+    sub.loop_start()
+
 
 @app.on_event("startup")
 def startup():
